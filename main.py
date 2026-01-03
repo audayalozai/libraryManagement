@@ -317,12 +317,30 @@ async def cb_set_file(event):
     os.rename(temp, target)
     await event.edit(f"✅ تم تحديث {target}", buttons=[[Button.inline("🔙 عودة", data="admin_panel")]])
 
-@bot_client.on(events.NewMessage(pattern='/add_channel (.*)'))
-async def handle_add_ch(event):
-    if not await check_force_join(event.sender_id): return
-    ch = event.pattern_match.group(1).strip()
-    if add_channel(ch): await event.respond(f"✅ تمت إضافة {ch}")
-    else: await event.respond("⚠️ مضافة مسبقاً.")
+@bot_client.on(events.NewMessage(incoming=True))
+async def handle_direct_add_ch(event):
+    # تجاهل الأوامر التي تبدأ بـ /
+    if event.text.startswith('/'): return
+    
+    # التحقق من الاشتراك الإجباري للمستخدمين العاديين
+    if event.sender_id != ADMIN_ID:
+        if not await check_force_join(event.sender_id):
+            return await event.respond(
+                f"⚠️ **يجب الاشتراك في قناتنا أولاً:**\n{settings['force_channel']}",
+                buttons=[Button.url("اضغط هنا للاشتراك", f"https://t.me/{settings['force_channel'].replace('@','')}")]
+            )
+
+    text = event.text.strip()
+    
+    # التحقق إذا كان النص المرسل يبدو كمعرف قناة (@username أو -100...)
+    if text.startswith('@') or (text.startswith('-100') and text[4:].isdigit()):
+        if add_channel(text):
+            await event.respond(f"✅ **تمت إضافة القناة بنجاح:** `{text}`\n\nسيتم البدء بالنشر التلقائي فيها حسب المواعيد المحددة.")
+        else:
+            await event.respond(f"⚠️ القناة `{text}` مضافة مسبقاً في النظام.")
+    elif event.sender_id == ADMIN_ID:
+        # إذا كان المدير يرسل نصاً عادياً، لا نفعل شيئاً أو يمكن إضافة وظائف أخرى
+        pass
 
 # ----------------------------------------------------------------------
 # 6. التشغيل
