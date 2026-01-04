@@ -9,6 +9,8 @@ import tempfile
 import shutil
 import time
 from functools import wraps
+# ===== إضافات إصلاح =====
+from html import escape  # FIX: لمنع فشل HTML الصامت
 
 # ===== تحميل المكتبات =====
 try:
@@ -272,11 +274,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===== معالج الملفات =====
 @admin_only
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    
-    if not doc.file_name.lower().endswith(".txt") or doc.file_size > 5*1024*1024:
-        await update.message.reply_text("❌ خطأ في الملف! يجب أن يكون .txt وأقل من 5 ميجابايت")
+    # FIX: لا نقبل الملف إلا إذا كان الأدمن في وضع رفع الاقتباسات
+    if context.user_data.get("action") != "awaiting_quotes_file":
         return
+
+    doc = update.message.document
+    ...
+    context.user_data.clear()  # FIX: تنظيف الحالة بعد النجاح
     
     safe_filename = Path(doc.file_name).name
     path = QUOTES_DIR / safe_filename
@@ -521,23 +525,23 @@ async def scheduled_post(context: ContextTypes.DEFAULT_TYPE):
     logger.info("⏰ بدء دورة النشر التلقائي")
     
     try:
+        # تحميل القنوات/المجموعات
         channels_data = load_channels_data()
         if not channels_data:
             logger.warning("⚠️ لا توجد قنوات أو مجموعات مضافة")
             return
         
-        logger.info(f"📣 عدد القنوات/المجموعات: {len(channels_data)}")
-        
+        # الحصول على جميع الاقتباسات من الكاش
         all_quotes = await quotes_cache.get_all_quotes()
         if not all_quotes:
             logger.warning("⚠️ لا توجد اقتباسات متاحة")
             return
-        
-        logger.info(f"📝 عدد الاقتباسات: {len(all_quotes):,}")
-        
+
+        # تحميل سجل المنشورات
         posted_quotes = load_json(POSTED_QUOTES_FILE, [])
         available_quotes = [q for q in all_quotes if q not in posted_quotes]
-        
+
+        # إعادة تعيين السجل إذا نفدت الاقتباسات
         if not available_quotes:
             logger.info("🔔 إعادة تعيين سجل المنشورات...")
             posted_quotes = []
@@ -547,12 +551,13 @@ async def scheduled_post(context: ContextTypes.DEFAULT_TYPE):
         message_text = random.choice(available_quotes)
         logger.info(f"💬 الاقتباس المختار: {message_text[:50]}...")
 
-        # إرسال الاقتباس لكل القنوات والمجموعات مع blockquote
+        # دالة إرسال الاقتباس لكل قناة/مجموعة مع حماية HTML
         async def send_to_chat(bot, chat_info: Dict, text: str) -> bool:
             try:
+                safe_text = escape(text)
                 await bot.send_message(
                     chat_id=int(chat_info["id"]),
-                    text=f"<blockquote>{text}</blockquote>",
+                    text=f"<blockquote>{safe_text}</blockquote>",
                     parse_mode="HTML"
                 )
                 return True
@@ -561,20 +566,23 @@ async def scheduled_post(context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"❌ فشل النشر في {chat_type} {chat_info['id']}: {e}")
                 return False
 
+        # تجهيز المهام وتشغيلها بشكل متوازي
         tasks = [send_to_chat(context.bot, item, message_text) for item in channels_data]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        success_count = sum(1 for r in results if r is True)
-        
+
+        # نحسب النجاح الحقيقي فقط
+        success_count = sum(1 for r in results if isinstance(r, bool) and r)
+
         # تحديث سجل المنشورات
         posted_quotes.append(message_text)
         if len(posted_quotes) > MAX_POSTED_QUOTES:
             posted_quotes = posted_quotes[-MAX_POSTED_QUOTES:]
         save_json(POSTED_QUOTES_FILE, posted_quotes)
-        
+
+        # تسجيل الوقت المستغرق
         elapsed = time.time() - start_time
         logger.info(f"✅ اكتمل النشر إلى {success_count}/{len(channels_data)} دردشة في {elapsed:.2f} ثانية")
-        
+
     except Exception as e:
         logger.error(f"❌ خطأ في النشر التلقائي: {e}", exc_info=True)
 
@@ -731,34 +739,28 @@ def load_scheduled_jobs(job_queue: JobQueue):
 def main():
     logger.info("🚀 بدء تشغيل البوت...")
     logger.info(f"👨‍💼 ADMIN_ID: {ADMIN_ID}")
-    
-    # التحقق من إعدادات النشر التلقائي
+
     schedule_settings = load_json(SCHEDULE_FILE, {"enabled": False, "interval": 3600})
     logger.info(f"📊 النشر التلقائي: {'مفعل' if schedule_settings.get('enabled') else 'معطل'}")
-    
-    # عرض عدد القنوات والمجموعات
+
     channels_data = load_channels_data()
     channels_count = sum(1 for item in channels_data if item["type"] == "channel")
     groups_count = sum(1 for item in channels_data if item["type"] in ["group", "supergroup"])
     logger.info(f"📢 القنوات: {channels_count} | المجموعات: {groups_count}")
-    
+
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_error_handler(error_handler)
+
+    # تحميل الجدولة مرة واحدة فقط
     load_scheduled_jobs(app.job_queue)
-    # إضافة المعالجات
+
+    # المعالجات
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Document.TXT & filters.User(ADMIN_ID), handle_document))
-    app.add_handler(MessageHandler(filters.ALL, message_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    # تحميل الجدولة
-    if app.job_queue:
-        load_scheduled_jobs(app.job_queue)
-    else:
-        logger.error("❌ JobQueue غير متوفر!")
-    
     logger.info("✅ البوت جاهز ويستمع للتحديثات...")
-    
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
