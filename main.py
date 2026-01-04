@@ -1,356 +1,766 @@
 import os
-import time
-import schedule
-import threading
-import asyncio
 import json
-from datetime import datetime
-from telethon import TelegramClient, events, Button
-from telethon.tl.types import PeerChannel
-from telethon.errors import UserNotParticipantError
-from config import API_ID, API_HASH, BOT_TOKEN, ADMIN_ID, MORNING_AZKAR_FILE, EVENING_AZKAR_FILE, GENERAL_AZKAR_FILE, CHANNELS_DB
+import random
+import asyncio
+import logging
+from pathlib import Path
+from typing import Any, List, Dict
+import tempfile
+import shutil
+import time
+from functools import wraps
 
-# ----------------------------------------------------------------------
-# 1. الإعدادات والتهيئة
-# ----------------------------------------------------------------------
-
-# ملف الإعدادات المتقدمة (أوقات النشر، الاشتراك الإجباري)
-SETTINGS_FILE = "bot_settings.json"
-
-def load_settings():
-    default_settings = {
-        "morning_time": "06:00",
-        "evening_time": "18:00",
-        "general_times": ["00:00", "03:00", "09:00", "12:00", "15:00", "21:00"],
-        "force_channel": "", # معرف القناة للاشتراك الإجباري (مثلاً @MyChannel)
-        "daily_report": True
-    }
-    if not os.path.exists(SETTINGS_FILE):
-        with open(SETTINGS_FILE, 'w') as f:
-            json.dump(default_settings, f)
-        return default_settings
-    with open(SETTINGS_FILE, 'r') as f:
-        return json.load(f)
-
-def save_settings(settings):
-    with open(SETTINGS_FILE, 'w') as f:
-        json.dump(settings, f)
-
-settings = load_settings()
-
-# تهيئة اليوزر بوت (UserBot)
-user_client = TelegramClient('user_session', API_ID, API_HASH)
-
-# تهيئة بوت التحكم (Controller Bot)
-bot_client = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
-
-# ----------------------------------------------------------------------
-# 2. وظائف إدارة الملفات وقاعدة البيانات
-# ----------------------------------------------------------------------
-
-def get_channels():
-    if not os.path.exists(CHANNELS_DB): return []
-    with open(CHANNELS_DB, 'r', encoding='utf-8') as f:
-        return [line.strip() for line in f if line.strip()]
-
-def add_channel(channel_id):
-    channels = get_channels()
-    if channel_id not in channels:
-        with open(CHANNELS_DB, 'a', encoding='utf-8') as f:
-            f.write(f"{channel_id}\n")
-        return True
-    return False
-
-def remove_channel(channel_id):
-    channels = get_channels()
-    if channel_id in channels:
-        channels.remove(channel_id)
-        with open(CHANNELS_DB, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(channels) + '\n')
-        return True
-    return False
-
-def get_content_lines(file_path):
-    if not os.path.exists(file_path): return []
-    with open(file_path, 'r', encoding='utf-8') as f:
-        return [line.strip() for line in f if line.strip()]
-
-content_pointers = {MORNING_AZKAR_FILE: 0, EVENING_AZKAR_FILE: 0, GENERAL_AZKAR_FILE: 0}
-
-# ----------------------------------------------------------------------
-# 3. وظيفة النشر والتقارير
-# ----------------------------------------------------------------------
-
-async def post_scheduled_message(file_type):
-    file_path = {"morning": MORNING_AZKAR_FILE, "evening": EVENING_AZKAR_FILE, "general": GENERAL_AZKAR_FILE}.get(file_type)
-    if not file_path: return False
-
-    content_lines = get_content_lines(file_path)
-    if not content_lines: return False
-
-    current_index = content_pointers.get(file_path, 0)
-    message_to_post = content_lines[current_index]
-    content_pointers[file_path] = (current_index + 1) % len(content_lines)
-
-    channels = get_channels()
-    if not channels: return False
-
-    success_count = 0
-    fail_count = 0
-    
-    async with user_client:
-        for channel in channels:
-            try:
-                await user_client.send_message(channel, message_to_post)
-                success_count += 1
-            except Exception:
-                fail_count += 1
-    
-    # إرسال تقرير للمدير
-    if settings.get("daily_report"):
-        report = (
-            f"📊 **تقرير نشر ({file_type}):**\n"
-            f"✅ تم بنجاح: `{success_count}`\n"
-            f"❌ فشل: `{fail_count}`\n"
-            f"🕒 الوقت: `{datetime.now().strftime('%H:%M')}`"
-        )
-        await bot_client.send_message(ADMIN_ID, report)
-    
-    return True
-
-# ----------------------------------------------------------------------
-# 4. وظيفة الجدولة (Scheduler)
-# ----------------------------------------------------------------------
-
-def run_async_task(file_type):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(post_scheduled_message(file_type))
-    loop.close()
-
-def start_scheduler():
-    schedule.clear()
-    # أذكار الصباح
-    schedule.every().day.at(settings["morning_time"]).do(run_async_task, "morning")
-    # أذكار المساء
-    schedule.every().day.at(settings["evening_time"]).do(run_async_task, "evening")
-    # الأذكار العامة
-    for t in settings["general_times"]:
-        schedule.every().day.at(t).do(run_async_task, "general")
-    
-    # نسخة احتياطية يومية الساعة 12 ليلاً
-    schedule.every().day.at("00:00").do(lambda: asyncio.run(send_backup()))
-
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
-
-async def send_backup():
-    if os.path.exists(CHANNELS_DB):
-        await bot_client.send_file(ADMIN_ID, CHANNELS_DB, caption="📦 **نسخة احتياطية لقائمة القنوات**")
-
-# ----------------------------------------------------------------------
-# 5. معالجات بوت التحكم
-# ----------------------------------------------------------------------
-
-async def check_force_join(user_id):
-    if not settings["force_channel"]: return True
-    try:
-        await bot_client.get_permissions(settings["force_channel"], user_id)
-        return True
-    except UserNotParticipantError:
-        return False
-    except:
-        return True
-
-@bot_client.on(events.NewMessage(pattern='/start'))
-async def handler_start(event):
-    if event.sender_id == ADMIN_ID:
-        await send_admin_panel(event.chat_id)
-    else:
-        if not await check_force_join(event.sender_id):
-            return await event.respond(
-                f"⚠️ **عذراً، يجب عليك الاشتراك في قناتنا أولاً لاستخدام البوت:**\n\n{settings['force_channel']}\n\nبعد الاشتراك، أرسل /start مرة أخرى.",
-                buttons=[Button.url("اضغط هنا للاشتراك", f"https://t.me/{settings['force_channel'].replace('@','')}")]
-            )
-        await event.respond("🙏 **مرحبا بك في بوت نشر الأذكار التلقائي**\n\nلإضافة قناتك، استخدم الأمر:\n`/add_channel @YourChannel`")
-
-async def send_admin_panel(chat_id, edit_message=None):
-    channels = get_channels()
-    message = (
-        "🛠 **لوحة التحكم الاحترافية**\n\n"
-        f"📊 **القنوات:** `{len(channels)}` | **التقرير:** `{'✅' if settings['daily_report'] else '❌'}`\n"
-        f"📢 **الاشتراك الإجباري:** `{settings['force_channel'] or 'معطل'}`\n"
-        f"⏰ **الصباح:** `{settings['morning_time']}` | **المساء:** `{settings['evening_time']}`\n"
+# ===== تحميل المكتبات =====
+try:
+    from dotenv import load_dotenv
+    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram.ext import (
+        Application,
+        CommandHandler,
+        MessageHandler,
+        CallbackQueryHandler,
+        ContextTypes,
+        filters,
+        JobQueue,
     )
-    buttons = [
-        [Button.inline("📢 إدارة القنوات", data="manage_channels"), Button.inline("⏰ ضبط الأوقات", data="set_times")],
-        [Button.inline("🔐 الاشتراك الإجباري", data="set_force"), Button.inline("📁 الملفات", data="upload_files")],
-        [Button.inline("🚀 نشر فوري", data="post_now"), Button.inline("✉️ إعلان جماعي", data="broadcast_msg")],
-        [Button.inline("📦 نسخة احتياطية", data="get_backup"), Button.inline("📊 التقرير: " + ("إيقاف" if settings['daily_report'] else "تفعيل"), data="toggle_report")]
+except ImportError as e:
+    print("="*50)
+    print(f"خطأ: المكتبات المطلوبة غير مثبتة: {e}")
+    print("تثبيت: pip install python-telegram-bot==20.7 python-dotenv")
+    print("="*50)
+    exit(1)
+
+# إعداد التسجيل
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler("bot.log", encoding="utf-8"),
+        logging.StreamHandler()
     ]
-    if edit_message: await edit_message.edit(message, buttons=buttons)
-    else: await bot_client.send_message(chat_id, message, buttons=buttons)
+)
+logger = logging.getLogger(__name__)
 
-@bot_client.on(events.CallbackQuery(data="admin_panel"))
-async def cb_admin_panel(event):
-    await send_admin_panel(event.chat_id, edit_message=event)
+# ===== تحميل المتغيرات =====
+load_dotenv(override=True)
 
-@bot_client.on(events.CallbackQuery(data="toggle_report"))
-async def cb_toggle_report(event):
-    settings["daily_report"] = not settings["daily_report"]
-    save_settings(settings)
-    await send_admin_panel(event.chat_id, edit_message=event)
+required_vars = ["BOT_TOKEN", "ADMIN_ID"]
+for var in required_vars:
+    value = os.getenv(var)
+    if not value:
+        logger.critical(f"❌ متغير البيئة المفقود: {var}")
+        exit(1)
 
-@bot_client.on(events.CallbackQuery(data="get_backup"))
-async def cb_backup(event):
-    await send_backup()
-    await event.answer("✅ تم إرسال النسخة الاحتياطية")
+try:
+    ADMIN_ID = int(os.getenv("ADMIN_ID"))
+except ValueError:
+    logger.critical("❌ ADMIN_ID يجب أن يكون رقمًا")
+    exit(1)
 
-# --- ضبط الأوقات ---
-@bot_client.on(events.CallbackQuery(data="set_times"))
-async def cb_set_times(event):
-    msg = (
-        "⏰ **إعدادات أوقات النشر:**\n\n"
-        f"🌅 الصباح: `{settings['morning_time']}`\n"
-        f"🌃 المساء: `{settings['evening_time']}`\n\n"
-        "لتغيير وقت الصباح أرسل: `صباح 07:00`\n"
-        "لتغيير وقت المساء أرسل: `مساء 19:00`"
-    )
-    await event.edit(msg, buttons=[[Button.inline("🔙 عودة", data="admin_panel")]])
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+QUOTES_DIR = Path(os.getenv("QUOTES_DIR", "data/quotes")).resolve()
+CHANNELS_FILE = Path("data/channels.json").resolve()
+SCHEDULE_FILE = Path("data/schedule.json").resolve()
+POSTED_QUOTES_FILE = Path("data/posted_quotes.json").resolve()
+MAX_POSTED_QUOTES = 5000
 
-@bot_client.on(events.NewMessage(pattern=r'^(صباح|مساء) (\d{2}:\d{2})$'))
-async def handle_time_change(event):
-    if event.sender_id != ADMIN_ID: return
-    type_time = event.pattern_match.group(1)
-    new_time = event.pattern_match.group(2)
-    if type_time == "صباح": settings["morning_time"] = new_time
-    else: settings["evening_time"] = new_time
-    save_settings(settings)
-    # إعادة تشغيل المجدول لتحديث الأوقات
-    threading.Thread(target=start_scheduler, daemon=True).start()
-    await event.respond(f"✅ تم تحديث وقت {type_time} إلى {new_time}", buttons=[[Button.inline("🔙 عودة", data="admin_panel")]])
+# إنشاء المجلدات
+QUOTES_DIR.mkdir(parents=True, exist_ok=True)
+CHANNELS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-# --- الاشتراك الإجباري ---
-@bot_client.on(events.CallbackQuery(data="set_force"))
-async def cb_set_force(event):
-    msg = (
-        "🔐 **إعدادات الاشتراك الإجباري:**\n\n"
-        f"القناة الحالية: `{settings['force_channel'] or 'لا يوجد'}`\n\n"
-        "لتغيير القناة أرسل المعرف: `/force @MyChannel`\n"
-        "لتعطيل الميزة أرسل: `/force off`"
-    )
-    await event.edit(msg, buttons=[[Button.inline("🔙 عودة", data="admin_panel")]])
-
-@bot_client.on(events.NewMessage(pattern='/force (.*)'))
-async def handle_force_set(event):
-    if event.sender_id != ADMIN_ID: return
-    val = event.pattern_match.group(1).strip()
-    if val.lower() == "off": settings["force_channel"] = ""
-    else: settings["force_channel"] = val
-    save_settings(settings)
-    await event.respond(f"✅ تم تحديث إعدادات الاشتراك الإجباري.", buttons=[[Button.inline("🔙 عودة", data="admin_panel")]])
-
-# --- (باقي المعالجات السابقة مدمجة ومحسنة) ---
-@bot_client.on(events.CallbackQuery(data="manage_channels"))
-async def handler_manage_channels(event):
-    channels = get_channels()
-    msg = "**📢 إدارة القنوات:**\n\n" + ("\n".join([f"- `{c}`" for c in channels]) if channels else "لا توجد قنوات.")
-    buttons = [[Button.inline("🗑 حذف قناة", data="del_mode")], [Button.inline("🔙 عودة", data="admin_panel")]]
-    await event.edit(msg, buttons=buttons)
-
-@bot_client.on(events.CallbackQuery(data="del_mode"))
-async def cb_del_mode(event):
-    channels = get_channels()
-    buttons = [[Button.inline(f"❌ {c}", data=f"del_ch_{c}")] for c in channels[:10]]
-    buttons.append([Button.inline("🔙 عودة", data="manage_channels")])
-    await event.edit("اختر القناة لحذفها:", buttons=buttons)
-
-@bot_client.on(events.CallbackQuery(pattern=r"del_ch_(.*)"))
-async def cb_del_exec(event):
-    ch = event.pattern_match.group(1).decode('utf-8')
-    if remove_channel(ch): await event.answer(f"✅ تم حذف {ch}", alert=True)
-    await handler_manage_channels(event)
-
-@bot_client.on(events.CallbackQuery(data="post_now"))
-async def cb_post_now(event):
-    buttons = [[Button.inline("🌅 صباح", data="f_morning"), Button.inline("🌃 مساء", data="f_evening")], [Button.inline("📖 عام", data="f_general")], [Button.inline("🔙 عودة", data="admin_panel")]]
-    await event.edit("🚀 نشر فوري الآن:", buttons=buttons)
-
-@bot_client.on(events.CallbackQuery(pattern=r"f_(.*)"))
-async def cb_force_exec(event):
-    t = event.pattern_match.group(1).decode('utf-8')
-    await event.answer("⏳ جاري النشر...")
-    if await post_scheduled_message(t): await event.respond(f"✅ تم نشر {t} بنجاح.")
-    else: await event.respond("❌ فشل النشر.")
-
-@bot_client.on(events.CallbackQuery(data="broadcast_msg"))
-async def cb_broadcast(event):
-    await event.edit("✉️ أرسل: `/broadcast نص الرسالة`", buttons=[[Button.inline("🔙 عودة", data="admin_panel")]])
-
-@bot_client.on(events.NewMessage(pattern='/broadcast (.*)'))
-async def handle_broadcast(event):
-    if event.sender_id != ADMIN_ID: return
-    msg = event.pattern_match.group(1)
-    channels = get_channels()
-    count = 0
-    async with user_client:
-        for c in channels:
-            try: await user_client.send_message(c, msg); count += 1
-            except: pass
-    await event.respond(f"✅ تم الإرسال إلى {count} قناة.")
-
-@bot_client.on(events.CallbackQuery(data="upload_files"))
-async def cb_upload(event):
-    await event.edit("📁 أرسل ملف `.txt` لتحديث المحتوى.", buttons=[[Button.inline("🔙 عودة", data="admin_panel")]])
-
-@bot_client.on(events.NewMessage(incoming=True, func=lambda e: e.file and e.file.name.endswith('.txt')))
-async def handle_file(event):
-    if event.sender_id != ADMIN_ID: return
-    path = await event.download_media(file=os.getcwd())
-    btns = [[Button.inline("🌅 صباح", data=f"s_{MORNING_AZKAR_FILE}_{path}"), Button.inline("🌃 مساء", data=f"s_{EVENING_AZKAR_FILE}_{path}")], [Button.inline("📖 عام", data=f"s_{GENERAL_AZKAR_FILE}_{path}")]]
-    await event.respond(f"📥 ملف: `{os.path.basename(path)}`\nحدد النوع:", buttons=btns)
-
-@bot_client.on(events.CallbackQuery(pattern=r"s_(.*)_(.*)"))
-async def cb_set_file(event):
-    target, temp = event.pattern_match.group(1).decode('utf-8'), event.pattern_match.group(2).decode('utf-8')
-    os.rename(temp, target)
-    await event.edit(f"✅ تم تحديث {target}", buttons=[[Button.inline("🔙 عودة", data="admin_panel")]])
-
-@bot_client.on(events.NewMessage(incoming=True))
-async def handle_direct_add_ch(event):
-    # تجاهل الأوامر التي تبدأ بـ /
-    if event.text.startswith('/'): return
+# ===== أدوات JSON =====
+def load_json(file_path: Path, default_value: Any) -> Any:
+    if not file_path.exists():
+        return default_value
     
-    # التحقق من الاشتراك الإجباري للمستخدمين العاديين
-    if event.sender_id != ADMIN_ID:
-        if not await check_force_join(event.sender_id):
-            return await event.respond(
-                f"⚠️ **يجب الاشتراك في قناتنا أولاً:**\n{settings['force_channel']}",
-                buttons=[Button.url("اضغط هنا للاشتراك", f"https://t.me/{settings['force_channel'].replace('@','')}")]
-            )
+    try:
+        with open(file_path, "r", encoding="utf-8", errors='ignore') as f:
+            content = f.read().strip()
+            if not content:
+                return default_value
+            return json.loads(content)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.error(f"❌ خطأ في قراءة {file_path.name}: {e}")
+        backup_path = file_path.with_suffix(f'.json.bak.{int(time.time())}')
+        shutil.copy2(file_path, backup_path)
+        return default_value
 
-    text = event.text.strip()
+def save_json(file_path: Path, data: Any) -> bool:
+    try:
+        temp_path = file_path.with_suffix('.tmp')
+        with open(temp_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=None)
+        
+        temp_path.replace(file_path)
+        return True
+    except Exception as e:
+        logger.error(f"❌ خطأ في حفظ {file_path.name}: {e}")
+        if 'temp_path' in locals() and temp_path.exists():
+            temp_path.unlink()
+        return False
+
+# ===== إدارة القنوات والمجموعات =====
+def load_channels_data() -> List[Dict]:
+    """تحميل القنوات والمجموعات مع التوافقية مع البنية القديمة"""
+    data = load_json(CHANNELS_FILE, [])
     
-    # التحقق إذا كان النص المرسل يبدو كمعرف قناة (@username أو -100...)
-    if text.startswith('@') or (text.startswith('-100') and text[4:].isdigit()):
-        if add_channel(text):
-            await event.respond(f"✅ **تمت إضافة القناة بنجاح:** `{text}`\n\nسيتم البدء بالنشر التلقائي فيها حسب المواعيد المحددة.")
-        else:
-            await event.respond(f"⚠️ القناة `{text}` مضافة مسبقاً في النظام.")
-    elif event.sender_id == ADMIN_ID:
-        # إذا كان المدير يرسل نصاً عادياً، لا نفعل شيئاً أو يمكن إضافة وظائف أخرى
+    # التحقق من البنية القديمة (قائمة من الأوتار)
+    if data and isinstance(data, list) and len(data) > 0 and isinstance(data[0], str):
+        logger.info("🔄 تحويل بيانات القنوات من البنية القديمة...")
+        new_data = [{"id": cid, "type": "channel", "title": "غير معروف"} for cid in data]
+        save_json(CHANNELS_FILE, new_data)
+        return new_data
+    
+    return data if isinstance(data, list) else []
+
+def save_channels_data(data: List[Dict]) -> bool:
+    return save_json(CHANNELS_FILE, data)
+
+def add_chat_to_data(chat_info: Dict) -> bool:
+    """إضافة قناة أو مجموعة إلى البيانات"""
+    try:
+        data = load_channels_data()
+        chat_id_str = str(chat_info["id"])
+        
+        # التحقق من التكرار
+        for item in data:
+            if item["id"] == chat_id_str:
+                return False
+        
+        data.append(chat_info)
+        return save_channels_data(data)
+    except Exception as e:
+        logger.error(f"❌ خطأ في إضافة الدردشة: {e}")
+        return False
+
+def remove_chat_from_data(chat_id: str) -> bool:
+    """حذف قناة أو مجموعة من البيانات"""
+    try:
+        data = load_channels_data()
+        initial_length = len(data)
+        
+        data = [item for item in data if item["id"] != chat_id]
+        
+        if len(data) < initial_length:
+            return save_channels_data(data)
+        return False
+    except Exception as e:
+        logger.error(f"❌ خطأ في حذف الدردشة: {e}")
+        return False
+
+# ===== كاش الاقتباسات =====
+class QuotesCache:
+    def __init__(self, quotes_dir: Path):
+        self.quotes_dir = quotes_dir
+        self._cache: list[str] = []
+        self._cache_time: float = 0
+        self._file_times: dict[str, float] = {}
+    
+    async def get_all_quotes(self) -> list[str]:
+        now = time.time()
+        if now - self._cache_time > 300:  # 5 دقائق
+            await self._reload_cache()
+            self._cache_time = now
+        return self._cache.copy()
+    
+    async def _reload_cache(self):
+        current_files = {f.name: f.stat().st_mtime for f in self.quotes_dir.glob("*.txt") if f.is_file()}
+        if self._file_times == current_files and self._cache:
+            return
+        
+        logger.info("🔄 تحديث كاش الاقتباسات...")
+        self._cache = []
+        
+        for filename, mtime in current_files.items():
+            file = self.quotes_dir / filename
+            try:
+                loop = asyncio.get_event_loop()
+                lines = await loop.run_in_executor(None, self._read_file, file)
+                
+                valid_lines = [line.strip() for line in lines if line.strip() and len(line.strip()) <= 4096]
+                self._cache.extend(valid_lines)
+                self._file_times[filename] = mtime
+            except Exception as e:
+                logger.error(f"❌ خطأ في قراءة {filename}: {e}")
+        
+        logger.info(f"✅ {len(self._cache):,} أذكار جاهزه")
+    
+    @staticmethod
+    def _read_file(file: Path) -> list[str]:
+        try:
+            with open(file, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.readlines()
+        except:
+            return []
+
+quotes_cache = QuotesCache(QUOTES_DIR)
+
+# ===== ديكور الأدمن فقط =====
+def admin_only(func):
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        if update.effective_user.id != ADMIN_ID:
+            if update.callback_query:
+                await update.callback_query.answer("❌ للأدمن فقط!", show_alert=True)
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+# ===== معالج الأخطاء =====
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Exception:", exc_info=context.error)
+    try:
+        await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ خطأ: {str(context.error)[:100]}", disable_notification=True)
+    except:
         pass
 
-# ----------------------------------------------------------------------
-# 6. التشغيل
-# ----------------------------------------------------------------------
+# ===== البدء =====
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    if user_id == ADMIN_ID:
+        # الحصول على حالة النشر التلقائي
+        schedule_settings = load_json(SCHEDULE_FILE, {"enabled": False, "interval": 3600})
+        is_enabled = schedule_settings.get("enabled", False)
+        status_emoji = "🟢" if is_enabled else "🔴"
+        status_text = "مفعل" if is_enabled else "معطل"
 
+        keyboard = [
+            [InlineKeyboardButton("📤 نشر رسالة", callback_data="post_custom")],
+            [InlineKeyboardButton(f"{status_emoji} التلقائي ({status_text})", callback_data="toggle_schedule")],
+            [InlineKeyboardButton("⏰ الفاصل", callback_data="set_interval")],
+            [InlineKeyboardButton("📂 القنوات/المجموعات", callback_data="manage_channels")],
+            [InlineKeyboardButton("➕ ملف اقتباسات", callback_data="add_quotes_file")],
+            [InlineKeyboardButton("🗑️ مسح السجل", callback_data="reset_posted_log")],
+        ]
+        text = "<blockquote>Welcome to the panel Admin : 👤</blockquote>"
+
+    else:
+        keyboard = [
+            [InlineKeyboardButton(
+                "➕ أضفني إلى دردشة",
+                url="https://t.me/q9gbot?startgroup=true"
+            )]
+        ]
+        text = """
+🌙 أهلا بك في بوت نشر الأذكار التلقائي 🌙
+
+قم بإضافة البوت إلى قناتك أو مجموعتك لتفعيل خدمة الأذكار والآيات.
+ارسل كلمة <b>تفعيل</b> للتفعيل في المجموعة.
+
+<blockquote>البوت يرسل أذكار وآيات قرآنية كل 20 دقيقة</blockquote>
+
+تواصل مع المدير @s_x_n
+"""
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # إرسال الرسالة أو تعديلها
+    if update.message:
+        await update.message.reply_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode="HTML"
+        )
+    elif update.callback_query:
+        await update.callback_query.edit_message_text(
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode="HTML"
+        )
+
+# ===== معالج الملفات =====
+@admin_only
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    
+    if not doc.file_name.lower().endswith(".txt") or doc.file_size > 5*1024*1024:
+        await update.message.reply_text("❌ خطأ في الملف! يجب أن يكون .txt وأقل من 5 ميجابايت")
+        return
+    
+    safe_filename = Path(doc.file_name).name
+    path = QUOTES_DIR / safe_filename
+    
+    try:
+        file = await context.bot.get_file(doc.file_id)
+        await file.download_to_drive(path)
+        
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = sum(1 for line in f if line.strip())
+        
+        if lines == 0:
+            path.unlink()
+            await update.message.reply_text("⚠️ الملف فارغ!")
+            return
+        
+        quotes_cache._cache_time = 0
+        
+        await update.message.reply_text(f"✅ تم حفظ: {safe_filename}\n📝 {lines:,} سطر")
+        logger.info(f"✅ ملف: {safe_filename} ({lines:,} سطر)")
+        
+    except Exception as e:
+        logger.error(f"❌ خطأ في تحميل الملف: {e}")
+        if path.exists():
+            path.unlink()
+
+# ===== معالج الرسائل العام =====
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    user_id = update.effective_user.id
+    text = update.message.text
+
+    # توجيه من القناة/مجموعة
+    if update.message.forward_from_chat:
+        forward_chat = update.message.forward_from_chat
+        if forward_chat.type in ['channel', 'group', 'supergroup']:
+            await add_channel_or_group_from_forward(update, context)
+            return
+
+    # أمر تفعيل (يدعم مع وبدون /)
+    if text and text.strip().replace("/", "") == "تفعيل" and update.message.chat.type in ['channel', 'group', 'supergroup']:
+        await activate_bot_in_channel_or_group(update, context)
+        return
+
+    # أوامر الأدمن
+    if user_id != ADMIN_ID:
+        if text:
+            await update.message.reply_text("لإضافة قناتك أو مجموعتك، قم بتوجيه رسالة منها إلى البوت.")
+        return
+
+    user_action = context.user_data.get("action")
+    
+    if user_action == "awaiting_custom_message" and text:
+        await receive_admin_message(update, context)
+        context.user_data.clear()
+    elif user_action == "awaiting_interval" and text and text.isdigit():
+        await set_schedule_interval(update, context)
+        context.user_data.clear()
+    else:
+        context.user_data.clear()
+        await update.message.reply_text("ارجع إلى القائمة الرئيسية:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 الرئيسية", callback_data="main_menu")]]))
+
+# ===== تفعيل البوت في القناة/مجموعة (الإصلاح الرئيسي) =====
+async def activate_bot_in_channel_or_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    
+    # التحقق من نوع الدردشة
+    if chat.type not in ['channel', 'group', 'supergroup']:
+        await update.message.reply_text("❌ يمكن التفعيل فقط في القنوات أو المجموعات!")
+        return
+    
+    # محاولة إرسال رسالة اختبارية لاختبار الصلاحيات
+    try:
+        # إرسال رسالة اختبارية
+        test_msg = await context.bot.send_message(
+            chat_id=chat.id, 
+            text="🔍 جاري التحقق من صلاحيات البوت...",
+            disable_notification=True
+        )
+        
+        # إذا نجح الإرسال، احذف الرسالة الاختبارية
+        await context.bot.delete_message(chat_id=chat.id, message_id=test_msg.message_id)
+        
+    except Exception as e:
+        logger.error(f"خطأ في إرسال رسالة اختبارية: {e}")
+        
+        # بناء رسالة خطأ واضحة
+        error_parts = ["❌ البوت لا يملك الصلاحيات الكافية!\n", "تأكد من:\n"]
+        
+        if chat.type == 'channel':
+            error_parts.append("1. إضافة البوت كمسؤول (Admin) في القناة\n")
+            error_parts.append("2. تفعيل صلاحية 'نشر الرسائل'\n")
+            error_parts.append("3. تفعيل صلاحية 'حذف الرسائل' (اختياري)")
+        else:
+            error_parts.append("1. إضافة البوت إلى المجموعة\n")
+            error_parts.append("2. جعله مسؤولاً (Admin)\n")
+            error_parts.append("3. تفعيل صلاحية 'إرسال الرسائل'\n")
+            error_parts.append("4. تفعيل صلاحية 'حذف الرسائل' (اختياري)")
+            
+        await update.message.reply_text("".join(error_parts))
+        return
+
+    # إضافة إلى البيانات
+    chat_info = {
+        "id": str(chat.id),
+        "type": chat.type,
+        "title": chat.title or "غير معروف"
+    }
+    
+    if add_chat_to_data(chat_info):
+        type_name = "القناة" if chat.type == 'channel' else "المجموعة"
+        emoji = "📢" if chat.type == 'channel' else "👥"
+        await update.message.reply_text(f"✅ تم تفعيل {type_name} بنجاح!\n\n{emoji} {chat.title}")
+        logger.info(f"✓ {type_name} جديدة: {chat.title} ({chat.id})")
+    else:
+        await update.message.reply_text("⚠️ القناة/المجموعة مضافة بالفعل.")
+
+# ===== إضافة من توجيه (الإصلاح الرئيسي) =====
+async def add_channel_or_group_from_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    forward_chat = msg.forward_from_chat
+
+    if not forward_chat or forward_chat.type not in ['channel', 'group', 'supergroup']:
+        await msg.reply_text("❌ الرجاء إعادة توجيه رسالة من قناة أو مجموعة فقط.")
+        return
+
+    # محاولة إرسال رسالة اختبارية لاختبار الصلاحيات
+    try:
+        test_msg = await context.bot.send_message(
+            chat_id=forward_chat.id, 
+            text="🔍 جاري التحقق من صلاحيات البوت...",
+            disable_notification=True
+        )
+        await context.bot.delete_message(chat_id=forward_chat.id, message_id=test_msg.message_id)
+        
+    except Exception as e:
+        logger.error(f"خطأ في إرسال رسالة اختبارية: {e}")
+        
+        error_parts = ["❌ البوت لا يملك الصلاحيات الكافية!\n", "تأكد من:\n"]
+        
+        if forward_chat.type == 'channel':
+            error_parts.append("1. إضافة البوت كمسؤول (Admin) في القناة\n")
+            error_parts.append("2. تفعيل صلاحية 'نشر الرسائل'\n")
+        else:
+            error_parts.append("1. إضافة البوت إلى المجموعة\n")
+            error_parts.append("2. جعله مسؤولاً (Admin)\n")
+            error_parts.append("3. تفعيل صلاحية 'إرسال الرسائل'\n")
+            
+        await msg.reply_text("".join(error_parts))
+        return
+
+    # إضافة إلى البيانات
+    chat_info = {
+        "id": str(forward_chat.id),
+        "type": forward_chat.type,
+        "title": forward_chat.title or "غير معروف"
+    }
+    
+    if add_chat_to_data(chat_info):
+        type_name = "القناة" if forward_chat.type == 'channel' else "المجموعة"
+        emoji = "📢" if forward_chat.type == 'channel' else "👥"
+        await msg.reply_text(f"✅ تم تفعيل {type_name}: {forward_chat.title}")
+        logger.info(f"✓ {type_name} جديدة: {forward_chat.title} ({forward_chat.id})")
+    else:
+        await msg.reply_text("⚠️ القناة/المجموعة مضافة بالفعل.")
+
+# ===== معالج الأزرار =====
+@admin_only
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    action = query.data
+    
+    try:
+        if action == "main_menu":
+            await start(update, context)
+        elif action == "post_custom":
+            await query.edit_message_text("✏️ أرسل الرسالة:")
+            context.user_data["action"] = "awaiting_custom_message"
+        elif action == "add_quotes_file":
+            await query.edit_message_text("📂 أرسل ملف .txt:")
+            context.user_data["action"] = "awaiting_quotes_file"
+        elif action == "manage_channels":
+            await manage_channels_menu(update, context)
+        elif action.startswith("remove_chat_"):
+            chat_id = action.split("_", 2)[2]
+            await remove_chat(update, context, chat_id)
+        elif action == "toggle_schedule":
+            await toggle_schedule(update, context)
+        elif action == "set_interval":
+            await query.edit_message_text("⏰ أرسل الفاصل بالدقائق (1-1440):")
+            context.user_data["action"] = "awaiting_interval"
+        elif action == "reset_posted_log":
+            save_json(POSTED_QUOTES_FILE, [])
+            await query.answer("✅ تم مسح سجل المنشورات", show_alert=True)
+            logger.info("🗑️ تم مسح سجل المنشورات")
+        elif action == "info_add_channel":
+            await query.edit_message_text(
+                "لإضافة قناة أو مجموعة:\n"
+                "1. أضف البوت مسؤول في القناة/المجموعة\n"
+                "2. أرسل `تفعيل` في القناة/المجموعة\n"
+                "أو قم بتوجيه رسالة من القناة/المجموعة هنا",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")]])
+            )
+    except Exception as e:
+        logger.error(f"❌ خطأ في معالج الأزرار: {e}")
+
+# ===== نشر رسالة مخصصة =====
+async def receive_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg_text = update.message.text
+    if not msg_text or len(msg_text) > 4096:
+        await update.message.reply_text("❌ نص غير صالح!")
+        return
+
+    channels_data = load_channels_data()
+    if not channels_data:
+        await update.message.reply_text("❌ لا توجد قنوات أو مجموعات.")
+        return
+
+    results = []
+    for item in channels_data:
+        try:
+            await context.bot.send_message(
+    chat_id=int(item["id"]),
+    text=f"<b>{msg_text}</b>",
+    parse_mode="HTML"
+)
+            results.append(f"✅ {item['id']}")
+        except Exception as e:
+            results.append(f"❌ {item['id']}: {str(e)[:30]}")
+
+    await update.message.reply_text("📢 النشر اكتمل:\n" + "\n".join(results[:20]))
+    await start(update, context)
+
+# ===== النشر التلقائي =====
+async def scheduled_post(context: ContextTypes.DEFAULT_TYPE):
+    """النشر التلقائي مع تسجيل مفصل"""
+    start_time = time.time()
+    logger.info("⏰ بدء دورة النشر التلقائي")
+    
+    try:
+        channels_data = load_channels_data()
+        if not channels_data:
+            logger.warning("⚠️ لا توجد قنوات أو مجموعات مضافة")
+            return
+        
+        logger.info(f"📣 عدد القنوات/المجموعات: {len(channels_data)}")
+        
+        all_quotes = await quotes_cache.get_all_quotes()
+        if not all_quotes:
+            logger.warning("⚠️ لا توجد اقتباسات متاحة")
+            return
+        
+        logger.info(f"📝 عدد الاقتباسات: {len(all_quotes):,}")
+        
+        posted_quotes = load_json(POSTED_QUOTES_FILE, [])
+        available_quotes = [q for q in all_quotes if q not in posted_quotes]
+        
+        if not available_quotes:
+            logger.info("🔔 إعادة تعيين سجل المنشورات...")
+            posted_quotes = []
+            available_quotes = all_quotes
+
+        # اختيار اقتباس عشوائي
+        message_text = random.choice(available_quotes)
+        logger.info(f"💬 الاقتباس المختار: {message_text[:50]}...")
+
+        # إرسال الاقتباس لكل القنوات والمجموعات مع blockquote
+        async def send_to_chat(bot, chat_info: Dict, text: str) -> bool:
+            try:
+                await bot.send_message(
+                    chat_id=int(chat_info["id"]),
+                    text=f"<blockquote>{text}</blockquote>",
+                    parse_mode="HTML"
+                )
+                return True
+            except Exception as e:
+                chat_type = "قناة" if chat_info.get("type") == "channel" else "مجموعة"
+                logger.error(f"❌ فشل النشر في {chat_type} {chat_info['id']}: {e}")
+                return False
+
+        tasks = [send_to_chat(context.bot, item, message_text) for item in channels_data]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        success_count = sum(1 for r in results if r is True)
+        
+        # تحديث سجل المنشورات
+        posted_quotes.append(message_text)
+        if len(posted_quotes) > MAX_POSTED_QUOTES:
+            posted_quotes = posted_quotes[-MAX_POSTED_QUOTES:]
+        save_json(POSTED_QUOTES_FILE, posted_quotes)
+        
+        elapsed = time.time() - start_time
+        logger.info(f"✅ اكتمل النشر إلى {success_count}/{len(channels_data)} دردشة في {elapsed:.2f} ثانية")
+        
+    except Exception as e:
+        logger.error(f"❌ خطأ في النشر التلقائي: {e}", exc_info=True)
+
+async def send_to_chat(bot, chat_info: Dict, message_text: str) -> bool:
+    """نشر سريع إلى قناة أو مجموعة واحدة"""
+    try:
+        await bot.send_message(chat_id=int(chat_info["id"]), text=message_text)
+        return True
+    except Exception as e:
+        chat_type = "قناة" if chat_info.get("type") == "channel" else "مجموعة"
+        logger.error(f"❌ فشل النشر في {chat_type} {chat_info['id']}: {e}")
+        return False
+
+# ===== تبديل الجدولة =====
+async def toggle_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تبديل النشر التلقائي مع حفظ فوري"""
+    schedule_settings = load_json(SCHEDULE_FILE, {"enabled": False, "interval": 3600})
+    
+    # تبديل الحالة
+    new_state = not schedule_settings.get("enabled", False)
+    schedule_settings["enabled"] = new_state
+    
+    # حفظ فوري
+    if not save_json(SCHEDULE_FILE, schedule_settings):
+        await update.callback_query.answer("❌ فشل حفظ الإعدادات!", show_alert=True)
+        return
+    
+    # إيقاف جميع الـ jobs القديمة
+    job_queue = context.application.job_queue
+    current_jobs = job_queue.get_jobs_by_name("scheduled_post")
+    for job in current_jobs:
+        job.schedule_removal()
+        logger.info("⏹️ إيقاف job قديم")
+    
+    # إنشاء job جديد إذا مفعل
+    if new_state:
+        interval = schedule_settings.get("interval", 3600)
+        job_queue.run_repeating(
+            scheduled_post,
+            interval=interval,
+            first=10,
+            name="scheduled_post"
+        )
+        minutes = interval // 60
+        await update.callback_query.answer(f"✅ تم تفعيل النشر كل {minutes} دقيقة", show_alert=True)
+        logger.info(f"✅ إنشاء job جديد كل {minutes} دقيقة")
+        
+        # اختبار فوري
+        asyncio.create_task(test_scheduled_post(context))
+    else:
+        await update.callback_query.answer("❌ تم إيقاف النشر التلقائي", show_alert=True)
+        logger.info("⏹️ تم إيقاف job النشر")
+    
+    await start(update, context)
+
+async def test_scheduled_post(context: ContextTypes.DEFAULT_TYPE):
+    """نشر اختباري بعد تفعيل الجدولة"""
+    await asyncio.sleep(15)
+    logger.info("🧪 اختبار النشر التلقائي بعد 15 ثانية...")
+    await scheduled_post(context)
+    logger.info("✅ الاختبار اكتمل")
+
+# ===== تعيين الفاصل الزمني =====
+async def set_schedule_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        interval_minutes = int(update.message.text)
+        if not 1 <= interval_minutes <= 1440:
+            await update.message.reply_text("❌ الفاصل يجب أن يكون بين 1-1440 دقيقة!")
+            return
+        
+        interval_seconds = interval_minutes * 60
+        schedule_settings = load_json(SCHEDULE_FILE, {"enabled": False, "interval": 3600})
+        schedule_settings["interval"] = interval_seconds
+        save_json(SCHEDULE_FILE, schedule_settings)
+        
+        await update.message.reply_text(f"✅ تم تعيين الفاصل إلى {interval_minutes} دقيقة")
+        
+        # إعادة تشغيل job إذا كان مفعلاً
+        if schedule_settings.get("enabled"):
+            job_queue = context.application.job_queue
+            current_jobs = job_queue.get_jobs_by_name("scheduled_post")
+            for job in current_jobs:
+                job.schedule_removal()
+            
+            job_queue.run_repeating(
+                scheduled_post,
+                interval=interval_seconds,
+                first=10,
+                name="scheduled_post"
+            )
+            logger.info(f"🔄 تم تحديث الفاصل إلى {interval_minutes} دقيقة")
+            
+    except ValueError:
+        await update.message.reply_text("❌ أرسل رقماً فقط!")
+    
+    await start(update, context)
+
+# ===== إدارة القنوات والمجموعات =====
+async def manage_channels_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    channels_data = load_channels_data()
+    if not channels_data:
+        await update.callback_query.edit_message_text("❌ لا توجد قنوات أو مجموعات مضافة.")
+        return
+
+    keyboard = []
+    for item in channels_data[:50]:
+        try:
+            chat = await context.bot.get_chat(int(item["id"]))
+            title = chat.title[:25] if chat.title else item["title"]
+        except:
+            title = f"غير معروف ({item['id'][-8:]})"
+        
+        type_emoji = "📢" if item["type"] == "channel" else "👥"
+        callback_data = f"remove_chat_{item['id']}"
+        
+        keyboard.append([InlineKeyboardButton(f"{type_emoji} {title}", callback_data=callback_data)])
+    
+    keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")])
+    
+    await update.callback_query.edit_message_text(
+        f"اضغط لحذف قناة أو مجموعة (الإجمالي: {len(channels_data)}):", 
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def remove_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: str):
+    if remove_chat_from_data(chat_id):
+        await update.callback_query.answer("✅ تم الحذف بنجاح", show_alert=True)
+        logger.info(f"✓ حذف الدردشة {chat_id}")
+    else:
+        await update.callback_query.answer("⚠️ لم يتم العثور على الدردشة", show_alert=True)
+    
+    await manage_channels_menu(update, context)
+
+# ===== تحميل المهام عند البدء =====
+def load_scheduled_jobs(job_queue: JobQueue):
+    """تحميل المهام المجدولة عند بدء البوت"""
+    try:
+        schedule_settings = load_json(SCHEDULE_FILE, {"enabled": False, "interval": 3600})
+        
+        if schedule_settings.get("enabled"):
+            interval = schedule_settings.get("interval", 3600)
+            job_queue.run_repeating(
+                scheduled_post,
+                interval=interval,
+                first=10,
+                name="scheduled_post"
+            )
+            logger.info(f"✅ تم تحميل job النشر كل {interval/60:.1f} دقيقة")
+        else:
+            logger.info("⏸️ النشر التلقائي معطل")
+    except Exception as e:
+        logger.error(f"❌ خطأ في تحميل الجدولة: {e}", exc_info=True)
+
+# ===== التشغيل =====
 def main():
-    print("🚀 بدء تشغيل النظام الاحترافي...")
-    threading.Thread(target=start_scheduler, daemon=True).start()
-    user_client.start()
-    bot_client.run_until_disconnected()
+    logger.info("🚀 بدء تشغيل البوت...")
+    logger.info(f"👨‍💼 ADMIN_ID: {ADMIN_ID}")
+    
+    # التحقق من إعدادات النشر التلقائي
+    schedule_settings = load_json(SCHEDULE_FILE, {"enabled": False, "interval": 3600})
+    logger.info(f"📊 النشر التلقائي: {'مفعل' if schedule_settings.get('enabled') else 'معطل'}")
+    
+    # عرض عدد القنوات والمجموعات
+    channels_data = load_channels_data()
+    channels_count = sum(1 for item in channels_data if item["type"] == "channel")
+    groups_count = sum(1 for item in channels_data if item["type"] in ["group", "supergroup"])
+    logger.info(f"📢 القنوات: {channels_count} | المجموعات: {groups_count}")
+    
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_error_handler(error_handler)
 
-if __name__ == '__main__':
+    # إضافة المعالجات
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.Document.TXT & filters.User(ADMIN_ID), handle_document))
+    app.add_handler(MessageHandler(filters.ALL, message_handler))
+    app.add_handler(CallbackQueryHandler(button_handler))
+
+    # تحميل الجدولة
+    if app.job_queue:
+        load_scheduled_jobs(app.job_queue)
+    else:
+        logger.error("❌ JobQueue غير متوفر!")
+    
+    logger.info("✅ البوت جاهز ويستمع للتحديثات...")
+    
+    app.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
     main()
