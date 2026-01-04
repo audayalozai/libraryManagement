@@ -297,7 +297,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await update.message.reply_text(f"✅ تم حفظ: {safe_filename}\n📝 {lines:,} سطر")
         logger.info(f"✅ ملف: {safe_filename} ({lines:,} سطر)")
-        
+        await start(update, context)
     except Exception as e:
         logger.error(f"❌ خطأ في تحميل الملف: {e}")
         if path.exists():
@@ -602,15 +602,18 @@ async def toggle_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.answer("❌ فشل حفظ الإعدادات!", show_alert=True)
         return
     
-    # إيقاف جميع الـ jobs القديمة
     job_queue = context.application.job_queue
-    current_jobs = job_queue.get_jobs_by_name("scheduled_post")
-    for job in current_jobs:
-        job.schedule_removal()
-        logger.info("⏹️ إيقاف job قديم")
+    if job_queue:
+        # إيقاف جميع الـ jobs القديمة
+        current_jobs = job_queue.get_jobs_by_name("scheduled_post")
+        for job in current_jobs:
+            job.schedule_removal()
+            logger.info("⏹️ إيقاف job قديم")
+    else:
+        logger.warning("⚠️ JobQueue غير متوفر، لن يتم تعديل الجدولة")
     
     # إنشاء job جديد إذا مفعل
-    if new_state:
+    if new_state and job_queue:
         interval = schedule_settings.get("interval", 3600)
         job_queue.run_repeating(
             scheduled_post,
@@ -624,18 +627,12 @@ async def toggle_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # اختبار فوري
         asyncio.create_task(test_scheduled_post(context))
-    else:
+    elif not new_state:
         await update.callback_query.answer("❌ تم إيقاف النشر التلقائي", show_alert=True)
         logger.info("⏹️ تم إيقاف job النشر")
     
     await start(update, context)
 
-async def test_scheduled_post(context: ContextTypes.DEFAULT_TYPE):
-    """نشر اختباري بعد تفعيل الجدولة"""
-    await asyncio.sleep(15)
-    logger.info("🧪 اختبار النشر التلقائي بعد 15 ثانية...")
-    await scheduled_post(context)
-    logger.info("✅ الاختبار اكتمل")
 
 # ===== تعيين الفاصل الزمني =====
 async def set_schedule_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -653,8 +650,8 @@ async def set_schedule_interval(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(f"✅ تم تعيين الفاصل إلى {interval_minutes} دقيقة")
         
         # إعادة تشغيل job إذا كان مفعلاً
-        if schedule_settings.get("enabled"):
-            job_queue = context.application.job_queue
+        job_queue = context.application.job_queue
+        if schedule_settings.get("enabled") and job_queue:
             current_jobs = job_queue.get_jobs_by_name("scheduled_post")
             for job in current_jobs:
                 job.schedule_removal()
@@ -666,12 +663,14 @@ async def set_schedule_interval(update: Update, context: ContextTypes.DEFAULT_TY
                 name="scheduled_post"
             )
             logger.info(f"🔄 تم تحديث الفاصل إلى {interval_minutes} دقيقة")
+        elif not job_queue:
+            logger.warning("⚠️ JobQueue غير متوفر، لن يتم تعديل الجدولة")
             
     except ValueError:
         await update.message.reply_text("❌ أرسل رقماً فقط!")
     
     await start(update, context)
-
+    
 # ===== إدارة القنوات والمجموعات =====
 async def manage_channels_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channels_data = load_channels_data()
