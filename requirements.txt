@@ -2,3 +2,6 @@ python-telegram-bot[job-queue]>=20.7,<21
 python-dotenv>=1.0
 httpx>=0.26.0,<0.28
 aiosqlite>=0.18.0
+python-telegram-bot[job-queue]
+httpx
+aiosqlite
