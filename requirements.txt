@@ -1,4 +1,3 @@
-# ===== ملف requirements.txt للبوت كامل =====
 python-telegram-bot[job-queue]==20.6
-httpx==0.26.1
-aiosqlite==0.18.0
+httpx>=0.26.0,<0.28
+aiosqlite>=0.18.0
