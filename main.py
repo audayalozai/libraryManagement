@@ -742,11 +742,9 @@ def main():
     groups_count = sum(1 for item in channels_data if item["type"] in ["group", "supergroup"])
     logger.info(f"📢 القنوات: {channels_count} | المجموعات: {groups_count}")
     
-app = Application.builder().token(BOT_TOKEN).build()
-app.add_error_handler(error_handler)
-
-# 🔹 تحميل المهام المجدولة بعد إنشاء التطبيق
-load_scheduled_jobs(app.job_queue)
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_error_handler(error_handler)
+    load_scheduled_jobs(app.job_queue)
     # إضافة المعالجات
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Document.TXT & filters.User(ADMIN_ID), handle_document))
